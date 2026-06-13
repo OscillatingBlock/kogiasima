@@ -1,8 +1,6 @@
-use std::env;
 use std::env::current_dir;
 use std::fs::{create_dir_all, remove_dir, remove_dir_all};
 use std::path::Path;
-use std::process;
 use std::process::{Command, Stdio, exit};
 use std::thread::sleep;
 use std::time::Duration;
@@ -12,11 +10,20 @@ use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::{sys::wait::waitpid, unistd::*};
 
+use std::fs::File;
+use std::io::BufReader;
+
+pub mod config;
+use crate::config::*;
+
 pub struct Container {
     container_command: String,
     args: Vec<String>,
     chroot_path: String,
     cgroup_config: CgroupConfig,
+
+    env_vars: Vec<String>,
+    cwd: String,
 }
 
 pub struct CgroupConfig {
@@ -25,27 +32,51 @@ pub struct CgroupConfig {
 }
 
 impl Container {
-    pub fn build(args: Vec<String>) -> Result<Container, String> {
-        if args.len() < 1 {
-            return Err("You must provide a command to run in the container".to_string());
-        }
+    pub fn build_from_bundle(bundle_path: &Path) -> Result<Container, String> {
+        // Look for config.json inside the OCI bundle directory
+        let config_path = bundle_path.join("config.json");
+        let file =
+            File::open(&config_path).map_err(|e| format!("Failed to open config.json: {e}"))?;
+        let reader = BufReader::new(file);
 
-        let chroot_path = env::var("MINI_DOCKER_CHROOT").unwrap_or_else(|_| {
-            eprintln!("error: MINI_DOCKER_CHROOT environment variable is not set");
-            process::exit(1);
-        });
+        // Parse using our new structures
+        let oci_spec: OciConfig = serde_json::from_reader(reader)
+            .map_err(|e| format!("Parsing OCI config failed: {e}"))?;
 
-        let max_pid = env::var("MAX_PID").unwrap_or_else(|_| "max".to_string());
-        let max_memory = env::var("MAX_MEMORY").unwrap_or_else(|_| "max".to_string());
+        // Safely extract values out of Option wraps with smart fallbacks
+        let pids_limit = oci_spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.resources.as_ref())
+            .and_then(|r| r.pids.as_ref())
+            .map(|p| p.limit.to_string())
+            .unwrap_or_else(|| "max".to_string());
+
+        let mem_limit = oci_spec
+            .linux
+            .as_ref()
+            .and_then(|l| l.resources.as_ref())
+            .and_then(|r| r.memory.as_ref())
+            .and_then(|m| m.limit)
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "max".to_string());
+
+        let absolute_chroot_path = if oci_spec.root.path.is_relative() {
+            bundle_path.join(&oci_spec.root.path)
+        } else {
+            oci_spec.root.path.clone()
+        };
 
         Ok(Container {
-            container_command: args[0].clone(),
-            args: args[1..].to_vec(),
-            chroot_path: chroot_path,
+            container_command: oci_spec.process.args[0].clone(),
+            args: oci_spec.process.args[1..].to_vec(),
+            chroot_path: absolute_chroot_path.to_string_lossy().to_string(),
             cgroup_config: CgroupConfig {
-                max_pid,
-                max_memory,
+                max_pid: pids_limit,
+                max_memory: mem_limit,
             },
+            env_vars: oci_spec.process.env,
+            cwd: oci_spec.process.cwd,
         })
     }
 
@@ -56,6 +87,8 @@ impl Container {
     pub fn fork_and_run(&self) {
         let clone_flags =
             CloneFlags::CLONE_NEWUTS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS;
+
+        let (reader, writer) = nix::unistd::pipe().unwrap();
 
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
@@ -73,6 +106,9 @@ impl Container {
                     eprintln!("failed to setup cgroup for child process: {why}");
                 }
 
+                // 3. OCI compliance: Write 1 byte to the pipe to wake up the child process
+                nix::unistd::write(writer, &[1u8]).unwrap();
+
                 waitpid(child, None).unwrap();
 
                 cleanup_cgroup(&child_pid_string);
@@ -82,6 +118,13 @@ impl Container {
             //that will run the command
             Ok(ForkResult::Child) => {
                 unshare(clone_flags).expect("Failed to unshare namespaces");
+
+                //  OCI compliance: Tell the host we are ready, then block and wait
+                // We try to read 1 byte from the pipe. Since the host hasn't written anything,
+                // the kernel suspends this child process safely.
+                let mut sync_buf = [0u8; 1];
+                nix::unistd::read(reader, &mut sync_buf).unwrap();
+
                 if let Err(why) = mount(
                     None::<&str>,
                     "/",
@@ -105,27 +148,30 @@ impl Container {
                         Ok(ForkResult::Child) => {
                             setup_child_process(&self.chroot_path);
 
-                            //execute the command provided in args
-                            if self.args.len() > 1 {
-                                Command::new(&self.container_command)
-                                    .args(&self.args)
-                                    .stdin(Stdio::inherit())
-                                    .stderr(Stdio::inherit())
-                                    .stdout(Stdio::inherit())
-                                    .spawn()
-                                    .expect("Failed to execute command")
-                                    .wait()
-                                    .expect("Failed to wait on command");
-                            } else {
-                                Command::new(&self.container_command)
-                                    .stdin(Stdio::inherit())
-                                    .stderr(Stdio::inherit())
-                                    .stdout(Stdio::inherit())
-                                    .spawn()
-                                    .expect("Failed to execute command")
-                                    .wait()
-                                    .expect("Failed to wait on command");
+                            let mut cmd = Command::new(&self.container_command);
+                            if !self.args.is_empty() {
+                                cmd.args(&self.args);
                             }
+
+                            // 1. OCI COMPLIANCE: Inject the parsed environment variables array natively
+                            for env_var in &self.env_vars {
+                                if let Some((key, val)) = env_var.split_once('=') {
+                                    cmd.env(key, val);
+                                }
+                            }
+
+                            // 2. OCI COMPLIANCE: Set the internal execution directory (cwd)
+                            // We use the root-relative path inside the container
+                            cmd.current_dir(&self.cwd);
+
+                            // 3. Bind standard streams and spawn
+                            cmd.stdin(Stdio::inherit())
+                                .stderr(Stdio::inherit())
+                                .stdout(Stdio::inherit())
+                                .spawn()
+                                .expect("Failed to execute command")
+                                .wait()
+                                .expect("Failed to wait on command");
 
                             unmount_setup();
                             _exit(0);
@@ -210,7 +256,8 @@ fn pivot_root_setup(pivot_root_path_string: &String) {
 
     //3. remove old root directory if it already exists and create new
     let cwd = current_dir().expect("Failed to get current working directory");
-    let old_root_temp_path = cwd.join("old_root/");
+    // let old_root_temp_path = cwd.join("old_root/");
+    let old_root_temp_path = pivot_root_path.join("old_root");
 
     println!("cwd = {}", cwd.display());
     println!("old_root = {}", old_root_temp_path.display());
@@ -222,6 +269,7 @@ fn pivot_root_setup(pivot_root_path_string: &String) {
     create_dir_all(&old_root_temp_path).expect("Failed to create old root directory");
 
     //4. pivot root to pivot root path, putting old root in old_root directory
+    //Instead of using current_dir(), map old_root strictly INSIDE the target rootfs path
     pivot_root(".", "old_root").expect("Failed to pivot root");
     chdir("/").expect("Failed to change directory to new root");
 
@@ -241,15 +289,14 @@ fn pivot_root_setup(pivot_root_path_string: &String) {
 }
 
 fn bind_mount(pivot_root_path: &String) {
-    if let Err(why) = mount(
+    mount(
         Some(pivot_root_path.as_str()),
         pivot_root_path.as_str(),
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None::<&str>,
-    ) {
-        eprintln!("Failed to bind mount pivot root path: {why}");
-    }
+    )
+    .expect("CRITICAL: Failed to bind mount pivot root path");
 }
 
 //set pid limit for the child process using cgroups,
