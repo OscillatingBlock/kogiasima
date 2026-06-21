@@ -8,6 +8,8 @@ use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
 use nix::{sys::wait::waitpid, unistd::*};
 
+use tracing::{debug, error, info, instrument, warn};
+
 use anyhow::Context;
 
 use tokio::runtime::Runtime;
@@ -90,23 +92,26 @@ impl Container {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(command = %self.container_command, chroot = %self.chroot_path))]
     pub fn fork_and_run(&self) -> anyhow::Result<()> {
         let clone_flags = CloneFlags::CLONE_NEWUTS
             | CloneFlags::CLONE_NEWPID
             | CloneFlags::CLONE_NEWNS
             | CloneFlags::CLONE_NEWNET;
+        debug!(?clone_flags, "Preparing namespace flags for isolation");
 
         let (reader, writer) = nix::unistd::pipe().unwrap();
 
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child, .. }) => {
-                println!(
-                    "Continuing execution in parent process, new child has pid: {}",
-                    child
+                info!(
+                    child_pid = %child,
+                    "Fork seccessful. Monitoring child from parent context",
                 );
                 let child_pid_string = child.to_string();
 
                 // Make sure this is running!
+                debug!("Ensuring host ipv4 forwarding is enabled");
                 enable_host_ip_forwarding().context("Failed to toggle IP forwarding")?;
 
                 setup_cgroup(
@@ -121,24 +126,29 @@ impl Container {
                     .parse::<u32>()
                     .context("Failed to parse child pid to u32")?;
 
+                debug!("Starting tokio for host network isolation");
                 let rt = Runtime::new().context("Failed to create tokio runtime")?;
                 let result = rt.block_on(async {
                     init_network_isolation(child_pid_u32)
                         .await
                         .with_context(|| "failed to init network isolation ".to_string())
                 });
-                if let Err(result) = result {
-                    eprintln!("[host network] Failed to setup network isolation: {result}");
-                    return Err(result);
+                if let Err(err) = result {
+                    error!(error= ?err, "[host network] Failed to setup network isolation");
+                    return Err(err);
                 }
 
+                debug!("Initializing nftables for network isolation");
                 setup_nftables().context("Failed to setup nftables")?;
 
                 // 3. OCI compliance: Write 1 byte to the pipe to wake up the child process
+                debug!("waking up first child process through sync pipe");
                 nix::unistd::write(writer, &[1u8]).context("Failed to write to pipe")?;
 
+                debug!("Awaiting first child process termination");
                 waitpid(child, None).context("Failed to wait for child process")?;
 
+                info!(child_pid = %child, "Child exited cleanly. Initiating runtime resource cleanup");
                 cleanup_cgroup(&child_pid_string).context("Failed to cleanup cgroup")?;
                 Ok(())
             }
@@ -146,23 +156,19 @@ impl Container {
             //first child process to unshare namespaces and fork again to create the final child process
             //that will run the command
             Ok(ForkResult::Child) => {
-                unshare(clone_flags).context("Failed to unshare namespaces")?;
+                unshare(clone_flags).context("[child] Failed to unshare namespaces")?;
 
                 //  OCI compliance: Tell the host we are ready, then block and wait
                 // We try to read 1 byte from the pipe. Since the host hasn't written anything,
                 // the kernel suspends this child process safely.
                 let mut sync_buf = [0u8; 1];
-                nix::unistd::read(reader, &mut sync_buf).context("failed to read from pipe")?;
+                nix::unistd::read(reader, &mut sync_buf)
+                    .context("[child] Failed to read from pipe")?;
 
-                println!("dumping first child fds before setting up grandchild...");
-                for fd in std::fs::read_dir("/proc/self/fd")? {
-                    println!("{:?}", fd?.path());
-                }
-
-                //make root filesystem private
-                //// CRITICAL: Prevent systemd shared mount propagation from leaking to/from the host.
-                // Must happen immediately after `unshare` and before the sync pipe/second fork
-                // to avoid a race condition that triggers an `EBUSY` error during `pivot_root`.
+                //change root filesystem from shared to private
+                //since pivot root requires type of the parent mount of new_root and the
+                //parent mount of the current root directory to not be
+                //MS_SHARED;
                 mount(
                     None::<&str>,
                     "/",
@@ -170,7 +176,7 @@ impl Container {
                     MsFlags::MS_REC | MsFlags::MS_PRIVATE,
                     None::<&str>,
                 )
-                .context("Failed to remount root filesystem as private")?;
+                .context("[child] Failed to remount root filesystem as private")?;
 
                 unsafe {
                     // Linux requires a second fork after unshare(CLONE_NEWPID) for the new
@@ -184,7 +190,7 @@ impl Container {
                         //grand child process that will run the command in the new namespaces
                         Ok(ForkResult::Child) => {
                             setup_child_process(&self.chroot_path)
-                                .context("Failed to setup child process")?;
+                                .context("[grand child] Failed to setup grand child process")?;
 
                             let mut cmd = Command::new(&self.container_command);
                             if !self.args.is_empty() {
@@ -207,15 +213,18 @@ impl Container {
                                 .stderr(Stdio::inherit())
                                 .stdout(Stdio::inherit())
                                 .spawn()
-                                .expect("Failed to execute command")
+                                .expect("[grand child] Failed to execute command")
                                 .wait()
-                                .context("Failed to wait on command")?;
+                                .context("[grand child] Failed to wait on command")?;
 
-                            unmount_setup().context("Failed to complete unmount setup ")?;
+                            unmount_setup()
+                                .context("[grand child] Failed to complete unmount setup ")?;
                             _exit(0);
                         }
                         Err(why) => {
                             eprintln!("Fork failed: {why}");
+                            eprintln!("[child] Secondary PID engine fork failed: {why}");
+
                             exit(1);
                         }
                     }

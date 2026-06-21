@@ -245,6 +245,16 @@ pub fn enable_host_ip_forwarding() -> anyhow::Result<()> {
         println!("[host network] Kernel IPv4 forwarding is already enabled.");
     }
 
+    let current_state = fs::read_to_string(path)
+        .context("Failed to read from /proc/sys/net/ipv6/conf/all/forwarding")?;
+    if current_state.trim() != "1" {
+        println!("[host network] Toggling net.ipv6.conf.all.forwarding to 1");
+        fs::write(path, "1")
+            .context("Failed to write to /proc/sys/net/ipv6/conf/all/forwarding")?;
+    } else {
+        println!("[host network] Kernel IPv6 forwarding is already enabled.");
+    }
+
     Ok(())
 }
 
@@ -257,14 +267,14 @@ pub fn setup_nftables() -> anyhow::Result<()> {
 
     //create a new table
     batch.add(schema::NfListObject::Table(schema::Table {
-        family: types::NfFamily::IP,
+        family: types::NfFamily::INet,
         name: table_name.into(),
         ..Default::default()
     }));
 
     //create forward chain
     batch.add(schema::NfListObject::Chain(schema::Chain {
-        family: types::NfFamily::IP,
+        family: types::NfFamily::INet,
         table: table_name.into(),
         name: "forward_chain".into(),
         _type: Some(NfChainType::Filter),
@@ -276,7 +286,7 @@ pub fn setup_nftables() -> anyhow::Result<()> {
 
     //create NAT chain
     batch.add(schema::NfListObject::Chain(schema::Chain {
-        family: types::NfFamily::IP,
+        family: types::NfFamily::INet,
         table: table_name.into(),
         name: "nat_chain".into(),
         _type: Some(NfChainType::NAT),
@@ -300,7 +310,7 @@ pub fn setup_nftables() -> anyhow::Result<()> {
 fn add_batch_rules(batch: &mut Batch, table_name: String, host_wan: String, _container_ip: String) {
     //add rule to Translate outbound traffic, Masquerading
     batch.add(schema::NfListObject::Rule(schema::Rule {
-        family: types::NfFamily::IP,
+        family: types::NfFamily::INet,
         table: table_name.clone().into(),
         chain: "nat_chain".into(),
         expr: vec![
@@ -329,9 +339,9 @@ fn add_batch_rules(batch: &mut Batch, table_name: String, host_wan: String, _con
         comment: None,
     }));
 
-    //2 add rule to forward inbound traffic safely
+    //add rule to forward inbound traffic safely
     batch.add(schema::NfListObject::Rule(schema::Rule {
-        family: types::NfFamily::IP,
+        family: types::NfFamily::INet,
         table: table_name.clone().into(),
         chain: "forward_chain".into(),
         expr: vec![
@@ -373,9 +383,9 @@ fn add_batch_rules(batch: &mut Batch, table_name: String, host_wan: String, _con
         comment: None,
     }));
 
-    //3 add rule to allow container outbount packets to escape
+    //add rule to allow container outbount packets to escape
     batch.add(schema::NfListObject::Rule(schema::Rule {
-        family: types::NfFamily::IP,
+        family: types::NfFamily::INet,
         table: table_name.clone().into(),
         chain: "forward_chain".into(),
         expr: vec![
@@ -406,14 +416,10 @@ fn add_batch_rules(batch: &mut Batch, table_name: String, host_wan: String, _con
 }
 
 fn apply_firewall_rules(batch: Batch) -> anyhow::Result<()> {
-    // 1. Convert your Rust Batch structures into a standard OCI/nftables JSON string
     let json_payload = batch.to_nftables();
-    println!("[host firewall] JSON Payload: {json_payload:?}");
 
     println!("[host firewall] Injecting netfilter rules via netlink...");
 
-    // 2. Pass the JSON string directly to the nftables kernel execution driver.
-    // This handles the raw socket opening, bytecode transmission, and error checking.
     match helper::apply_ruleset(&json_payload) {
         Ok(_) => {
             println!("[host firewall] Ruleset applied successfully! Container routing is live.");
