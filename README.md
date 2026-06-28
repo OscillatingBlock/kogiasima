@@ -87,7 +87,3 @@ sudo RUST_LOG=info cargo run
 2. **First Fork & Unshare:** The first child splits away, instantly unsharing the isolated namespace boundaries (`CLONE_NEWNS`, etc.).
 3. **Host Optimization:** While the child safely suspends on a synchronization pipe, the host hooks into the active parent PID to structure the cgroup resource tracks, wire up the asymmetric `veth` cables to `br0`, and broadcast `nftables` netlink rules into the kernel.
 4. **Second Fork & Pivot:** The child cuts its root propagation line via `MS_PRIVATE`, triggers a secondary fork to trap the definitive PID constraints, invokes `pivot_root` to swap file systems, and gracefully replaces its thread image with your target program.
-
-```
-
-```
