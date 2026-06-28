@@ -48,14 +48,11 @@ pub struct CgroupConfig {
 
 impl Container {
     pub fn build_from_bundle(bundle_path: &Path) -> anyhow::Result<Container, anyhow::Error> {
-        // Look for config.json inside the OCI bundle directory
         let file = File::open(bundle_path)?;
         let reader = BufReader::new(file);
 
-        // Parse using our new structures
         let oci_spec: OciConfig = serde_json::from_reader(reader)?;
 
-        // Safely extract values out of Option wraps with smart fallbacks
         let pids_limit = oci_spec
             .linux
             .as_ref()
@@ -144,7 +141,9 @@ impl Container {
 
         let (reader, writer) = nix::unistd::pipe().unwrap();
 
+        // Spawn a child process with isolated Linux namespaces to create the container environment.
         match unsafe { fork() } {
+            // Parent process: configure the container environment, monitor execution, and clean up resources.
             Ok(ForkResult::Parent { child, .. }) => {
                 info!(
                     child_pid = %child,
@@ -182,7 +181,7 @@ impl Container {
                 debug!("Initializing nftables for network isolation");
                 setup_nftables(&self.id).context("Failed to setup nftables")?;
 
-                // 3. OCI compliance: Write 1 byte to the pipe to wake up the child process
+                // After setup Write 1 byte to the pipe to wake up the child process
                 debug!("waking up first child process through sync pipe");
                 nix::unistd::write(writer, &[1u8]).context("Failed to write to pipe")?;
 
@@ -202,7 +201,7 @@ impl Container {
             Ok(ForkResult::Child) => {
                 unshare(clone_flags).context("[child] Failed to unshare namespaces")?;
 
-                // OCI compliance: Tell the host we are ready, then block and wait
+                // Tell the host we are ready, then block and wait
                 // We try to read 1 byte from the pipe. Since the host hasn't written anything,
                 // the kernel suspends this child process safely.
                 let mut sync_buf = [0u8; 1];
@@ -247,11 +246,11 @@ impl Container {
                                 }
                             }
 
-                            // 2. OCI COMPLIANCE: Set the internal execution directory (cwd)
+                            // Set the internal execution directory (cwd)
                             // We use the root-relative path inside the container
                             cmd.current_dir(&self.cwd);
 
-                            // 3. Bind standard streams and spawn
+                            // Bind standard streams and spawn
                             cmd.stdin(Stdio::inherit())
                                 .stderr(Stdio::inherit())
                                 .stdout(Stdio::inherit())

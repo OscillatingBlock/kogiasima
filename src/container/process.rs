@@ -18,6 +18,8 @@ use crate::container::Container;
 
 use super::network::*;
 
+//used by child process itself, to pivot root, set hostname, mount important file sysetms and config
+//container network
 pub fn setup_child_process(chroot_path: &String, container: &Container) -> anyhow::Result<()> {
     //dont use tracing in child process functions
     pivot_root_setup(chroot_path).context("Failed to setup pivot root")?;
@@ -55,7 +57,7 @@ pub fn setup_child_process(chroot_path: &String, container: &Container) -> anyho
     )
     .context("Failed to mount dev filesystem")?;
 
-    // CRITICAL: Network config using Tokio must happen AFTER pivot_root.
+    // Network config using Tokio must happen AFTER pivot_root.
     // Creating a multi-threaded Tokio runtime spins up background OS worker threads.
     // Linux strictly forbids `pivot_root` if other threads in the process pool are
     // actively pinning/using the old root filesystem, which triggers a fatal `EBUSY` error.
