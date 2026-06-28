@@ -1,19 +1,26 @@
 use anyhow::Context;
 use std::path::Path;
 
+use tracing::{error, info};
+use tracing_subscriber;
+
 pub mod container;
 use container::Container;
+use container::cli;
 
 fn main() -> anyhow::Result<()> {
-    let bundle_path = Path::new("/home/aayush/alpine_bundle");
+    tracing_subscriber::fmt::init();
+
+    let cli = cli::build_config_file();
+    let bundle_path = Path::new(&cli.output);
 
     match Container::build_from_bundle(&bundle_path) {
         Ok(container) => {
-            println!("OCI bundle parsed successfully! Starting sandbox...");
+            info!("OCI bundle parsed successfully! Starting sandbox...");
             container.run().context("Failure while running container")?;
         }
         Err(e) => {
-            eprintln!("Initialization panic: {e}");
+            error!("Initialization panic: {e}");
             std::process::exit(1);
         }
     }

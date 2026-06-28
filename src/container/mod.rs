@@ -14,6 +14,8 @@ use anyhow::Context;
 
 use tokio::runtime::Runtime;
 
+use uuid::Uuid;
+
 pub mod config;
 use config::*;
 
@@ -23,14 +25,20 @@ use network::*;
 pub mod process;
 use process::*;
 
+pub mod cli;
+
 pub struct Container {
     container_command: String,
     args: Vec<String>,
     chroot_path: String,
     cgroup_config: CgroupConfig,
+    hostname: String,
+    namespaces: Vec<String>,
 
     env_vars: Vec<String>,
     cwd: String,
+
+    id: Uuid,
 }
 
 pub struct CgroupConfig {
@@ -39,16 +47,13 @@ pub struct CgroupConfig {
 }
 
 impl Container {
-    pub fn build_from_bundle(bundle_path: &Path) -> anyhow::Result<Container, String> {
+    pub fn build_from_bundle(bundle_path: &Path) -> anyhow::Result<Container, anyhow::Error> {
         // Look for config.json inside the OCI bundle directory
-        let config_path = bundle_path.join("config.json");
-        let file =
-            File::open(&config_path).map_err(|e| format!("Failed to open config.json: {e}"))?;
+        let file = File::open(bundle_path)?;
         let reader = BufReader::new(file);
 
         // Parse using our new structures
-        let oci_spec: OciConfig = serde_json::from_reader(reader)
-            .map_err(|e| format!("Parsing OCI config failed: {e}"))?;
+        let oci_spec: OciConfig = serde_json::from_reader(reader)?;
 
         // Safely extract values out of Option wraps with smart fallbacks
         let pids_limit = oci_spec
@@ -74,6 +79,20 @@ impl Container {
             oci_spec.root.path.clone()
         };
 
+        let hostname = oci_spec
+            .process
+            .hostname
+            .context("failed to get hostname from config file")?;
+
+        let namespaces: Vec<String> = oci_spec
+            .linux
+            .as_ref()
+            .unwrap()
+            .namespaces
+            .iter()
+            .map(|ns| ns.ns_type.to_string())
+            .collect();
+
         Ok(Container {
             container_command: oci_spec.process.args[0].clone(),
             args: oci_spec.process.args[1..].to_vec(),
@@ -82,8 +101,11 @@ impl Container {
                 max_pid: pids_limit,
                 max_memory: mem_limit,
             },
+            namespaces: namespaces,
+            hostname: hostname,
             env_vars: oci_spec.process.env,
             cwd: oci_spec.process.cwd,
+            id: Uuid::new_v4(),
         })
     }
 
@@ -92,13 +114,33 @@ impl Container {
         Ok(())
     }
 
+    pub fn clone_flags(&self) -> CloneFlags {
+        let mut flags = CloneFlags::empty();
+
+        for ns in &self.namespaces {
+            let flag = match ns.to_lowercase().as_str() {
+                "uts" => CloneFlags::CLONE_NEWUTS,
+                "pid" => CloneFlags::CLONE_NEWPID,
+                "mount" => CloneFlags::CLONE_NEWNS,
+                "network" => CloneFlags::CLONE_NEWNET,
+                "ipc" => CloneFlags::CLONE_NEWIPC,
+                "user" => CloneFlags::CLONE_NEWUSER,
+                "cgroup" => CloneFlags::CLONE_NEWCGROUP,
+                other => {
+                    eprintln!("warning: unknown namespace '{other}', skipping");
+                    continue;
+                }
+            };
+            flags |= flag;
+        }
+
+        flags
+    }
+
     #[instrument(skip(self), fields(command = %self.container_command, chroot = %self.chroot_path))]
     pub fn fork_and_run(&self) -> anyhow::Result<()> {
-        let clone_flags = CloneFlags::CLONE_NEWUTS
-            | CloneFlags::CLONE_NEWPID
-            | CloneFlags::CLONE_NEWNS
-            | CloneFlags::CLONE_NEWNET;
-        debug!(?clone_flags, "Preparing namespace flags for isolation");
+        let clone_flags = self.clone_flags();
+        info!(?clone_flags, "Preparing namespace flags for isolation");
 
         let (reader, writer) = nix::unistd::pipe().unwrap();
 
@@ -110,7 +152,6 @@ impl Container {
                 );
                 let child_pid_string = child.to_string();
 
-                // Make sure this is running!
                 debug!("Ensuring host ipv4 forwarding is enabled");
                 enable_host_ip_forwarding().context("Failed to toggle IP forwarding")?;
 
@@ -139,7 +180,7 @@ impl Container {
                 }
 
                 debug!("Initializing nftables for network isolation");
-                setup_nftables().context("Failed to setup nftables")?;
+                setup_nftables(&self.id).context("Failed to setup nftables")?;
 
                 // 3. OCI compliance: Write 1 byte to the pipe to wake up the child process
                 debug!("waking up first child process through sync pipe");
@@ -150,6 +191,9 @@ impl Container {
 
                 info!(child_pid = %child, "Child exited cleanly. Initiating runtime resource cleanup");
                 cleanup_cgroup(&child_pid_string).context("Failed to cleanup cgroup")?;
+
+                info!("Removing network isolation rules");
+                remove_firewall_rules(&self.id).context("Failed to remove firewall rules")?;
                 Ok(())
             }
 
@@ -158,7 +202,7 @@ impl Container {
             Ok(ForkResult::Child) => {
                 unshare(clone_flags).context("[child] Failed to unshare namespaces")?;
 
-                //  OCI compliance: Tell the host we are ready, then block and wait
+                // OCI compliance: Tell the host we are ready, then block and wait
                 // We try to read 1 byte from the pipe. Since the host hasn't written anything,
                 // the kernel suspends this child process safely.
                 let mut sync_buf = [0u8; 1];
@@ -189,7 +233,7 @@ impl Container {
                         }
                         //grand child process that will run the command in the new namespaces
                         Ok(ForkResult::Child) => {
-                            setup_child_process(&self.chroot_path)
+                            setup_child_process(&self.chroot_path, &self)
                                 .context("[grand child] Failed to setup grand child process")?;
 
                             let mut cmd = Command::new(&self.container_command);
@@ -197,7 +241,6 @@ impl Container {
                                 cmd.args(&self.args);
                             }
 
-                            // 1. OCI COMPLIANCE: Inject the parsed environment variables array natively
                             for env_var in &self.env_vars {
                                 if let Some((key, val)) = env_var.split_once('=') {
                                     cmd.env(key, val);

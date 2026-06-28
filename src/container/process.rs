@@ -14,14 +14,16 @@ use anyhow::Context;
 
 use tokio::runtime::Runtime;
 
+use crate::container::Container;
+
 use super::network::*;
 
-pub fn setup_child_process(chroot_path: &String) -> anyhow::Result<()> {
+pub fn setup_child_process(chroot_path: &String, container: &Container) -> anyhow::Result<()> {
     //dont use tracing in child process functions
     pivot_root_setup(chroot_path).context("Failed to setup pivot root")?;
 
     println!("[child] isolating system hostname");
-    sethostname("mini-docker").context("Failed to set hostname")?;
+    sethostname(container.hostname.as_str()).context("Failed to set hostname")?;
 
     // Mount essential virtual filesystems after pivot root
     // This ensures `/proc` and `/sys` are available for any network/system tools below.

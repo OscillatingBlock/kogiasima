@@ -17,6 +17,7 @@ use nftables::stmt::{Match, Operator, Statement};
 use nftables::{batch::Batch, helper, schema, types};
 
 use anyhow::Context;
+use uuid::Uuid;
 const VETH1_HOST: &str = "veth1_host";
 const VETH1_CONT: &str = "veth1_cont";
 
@@ -258,24 +259,24 @@ pub fn enable_host_ip_forwarding() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn setup_nftables() -> anyhow::Result<()> {
+pub fn setup_nftables(id: &Uuid) -> anyhow::Result<()> {
     //batch is used to prepare nftable payloads
     let mut batch = Batch::new();
-    let table_name: &'static str = "mini-docker";
+    let table_name = format!("mini-docker-{}", id.as_hyphenated());
     let host_wan: &'static str = "wlan0";
     let container_ip: &'static str = "10.0.0.1/24";
 
     //create a new table
     batch.add(schema::NfListObject::Table(schema::Table {
         family: types::NfFamily::INet,
-        name: table_name.into(),
+        name: table_name.clone().into(),
         ..Default::default()
     }));
 
     //create forward chain
     batch.add(schema::NfListObject::Chain(schema::Chain {
         family: types::NfFamily::INet,
-        table: table_name.into(),
+        table: table_name.clone().into(),
         name: "forward_chain".into(),
         _type: Some(NfChainType::Filter),
         hook: Some(types::NfHook::Forward),
@@ -287,7 +288,7 @@ pub fn setup_nftables() -> anyhow::Result<()> {
     //create NAT chain
     batch.add(schema::NfListObject::Chain(schema::Chain {
         family: types::NfFamily::INet,
-        table: table_name.into(),
+        table: table_name.clone().into(),
         name: "nat_chain".into(),
         _type: Some(NfChainType::NAT),
         hook: Some(types::NfHook::Postrouting),
@@ -298,7 +299,7 @@ pub fn setup_nftables() -> anyhow::Result<()> {
 
     add_batch_rules(
         &mut batch,
-        table_name.to_string(),
+        table_name.clone().to_string(),
         host_wan.to_string(),
         container_ip.to_string(),
     );
@@ -429,5 +430,25 @@ fn apply_firewall_rules(batch: Batch) -> anyhow::Result<()> {
             eprintln!("[host firewall] Critical error injecting rules: {:?}", e);
             Err(e.into())
         }
+    }
+}
+
+pub fn remove_firewall_rules(id: &Uuid) -> anyhow::Result<()> {
+    let mut batch = Batch::new();
+    let table_name = format!("mini-docker-{}", id.as_hyphenated());
+
+    println!("[host firewall] removing all firewall rules");
+    batch.delete(schema::NfListObject::Table(schema::Table {
+        family: types::NfFamily::INet,
+        name: table_name.into(),
+        ..Default::default()
+    }));
+    let ruleset = batch.to_nftables();
+    match helper::apply_ruleset(&ruleset) {
+        Ok(_) => {
+            println!("[host firewall] Firewall rules removed successfully");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
     }
 }
