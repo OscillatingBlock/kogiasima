@@ -37,6 +37,14 @@ Kogiasima features a built-in CLI compiler that dynamically spits out an  `confi
 
 ## Usage Guide
 
+To use the container you need to download a root filesystem for it ,you can use alpine mini as an example.
+
+### Get help about how to use
+
+```bash
+cargo run -- --help
+```
+
 ### Generate an OCI Configuration
 
 To compile a custom `config.json` specification directly into your container bundle root:
@@ -48,7 +56,8 @@ sudo cargo run -- \
   --pid-limit 30 \
   --memory-limit 104857600 \
   --env DEBIAN_FRONTEND=noninteractive \
-  --output "/home/aayush/alpine_bundle/config.json"
+  --rootfs "/path/to/your/rootfs/"
+  --output "/home/user/alpine_bundle/config.json"
 
 ```
 
